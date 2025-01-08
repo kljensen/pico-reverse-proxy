@@ -1,11 +1,16 @@
 # Pico reverse proxy
 
-A very small HTTP reverse proxy.
+A very small HTTP [reverse proxy](https://www.cloudflare.com/learning/cdn/glossary/reverse-proxy/).
 
-This does *not* support HTTPS. I created it because sometimes
+> [!WARNING]
+> - This does not support HTTPS
+> - You should not use this in production
+
+I created it because sometimes
 I need a reverse proxy in trusted networks and I don't want to run
 [caddy](https://caddyserver.com), [nginx](https://nginx.org/en/),
-or [haproxy](https://www.haproxy.com).
+or [haproxy](https://www.haproxy.com). Often this will be in some
+kind of embedded, resource-constrained environment.
 
 ## Building
 
