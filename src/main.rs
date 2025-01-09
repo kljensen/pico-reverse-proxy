@@ -1,8 +1,9 @@
-use tokio::{net::TcpListener, io::{AsyncReadExt, AsyncWriteExt}};
-use tokio::sync::Semaphore;
+use clap::Parser;
 use std::error::Error;
 use tokio::io::copy_bidirectional;
-use clap::Parser;
+use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
+use tokio::time::{timeout, Duration};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -14,36 +15,36 @@ struct Args {
     destination: String,
 }
 
-// Use smaller buffer size - 4KB is often sufficient for HTTP
-const BUFFER_SIZE: usize = 4096;
+async fn connect_with_timeout(destination: &str, timeout_duration: Duration) -> Option<tokio::net::TcpStream> {
+    match timeout(timeout_duration, tokio::net::TcpStream::connect(destination)).await {
+        Ok(connect_result) => match connect_result {
+            Ok(conn) => Some(conn),
+            Err(e) => {
+                eprintln!("Connection error: {}", e);
+                None
+            }
+        },
+        Err(_) => {
+            eprintln!("Connection timed out");
+            None
+        }
+    }
+}
 
-async fn handle_connection(
-    mut client_conn: tokio::net::TcpStream,
-    destination: &str,
-) {
-    // Stack-allocated buffer instead of heap
-    let mut buffer = [0u8; BUFFER_SIZE];
-    
+async fn handle_connection(mut client_conn: tokio::net::TcpStream, destination: &str) {
     // Set socket options to minimize memory
     if let Err(e) = client_conn.set_nodelay(true) {
         eprintln!("Failed to set nodelay: {}", e);
     }
 
-    let n = match client_conn.read(&mut buffer).await {
-        Ok(0) => return,
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("Failed to read from client: {}", e);
-            return;
-        }
-    };
-
-    let mut server_conn = match tokio::net::TcpStream::connect(destination).await {
-        Ok(conn) => conn,
-        Err(e) => {
-            eprintln!("Failed to connect to target server: {}", e);
-            return;
-        }
+    if client_conn.readable().await.is_err() {
+        eprintln!("Failed to read from client connection");
+        return;
+    }
+    let timeout_duration = Duration::from_secs(5);
+    let mut server_conn = match connect_with_timeout(destination, timeout_duration).await {
+        Some(conn) => conn,
+        None => return,
     };
 
     // Set socket options for server connection too
@@ -51,22 +52,28 @@ async fn handle_connection(
         eprintln!("Failed to set nodelay: {}", e);
     }
 
-    if let Err(e) = server_conn.write_all(&buffer[..n]).await {
-        eprintln!("Failed to write to server: {}", e);
-        return;
+    // Use splice if available on Linux systems
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Err(e) =
+            tokio::io::copy_bidirectional_zero_copy(&mut client_conn, &mut server_conn).await
+        {
+            eprintln!("Error in zero-copy: {}", e);
+        }
     }
-
-    match copy_bidirectional(&mut client_conn, &mut server_conn).await {
-        Ok(_) => (),  // Don't allocate strings for logging
-        Err(e) => eprintln!("Error in copy: {}", e),
+    #[cfg(not(target_os = "linux"))]
+    {
+        if let Err(e) = copy_bidirectional(&mut client_conn, &mut server_conn).await {
+            eprintln!("Error in copy: {}", e);
+        }
     }
 }
 
 static MAX_CONNECTIONS: usize = 100;
 static CONNECTION_SEMAPHORE: Semaphore = Semaphore::const_new(MAX_CONNECTIONS);
 
-
-#[tokio::main(flavor = "current_thread")]  // Single-threaded runtime
+#[tokio::main(flavor = "current_thread")] // Single-threaded runtime
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     let listener = TcpListener::bind(&args.source).await?;
@@ -74,7 +81,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     while let Ok((client_conn, _)) = listener.accept().await {
         // Pass destination as reference to avoid cloning
         let dest_clone = args.destination.clone();
-        
+
         let permit = CONNECTION_SEMAPHORE.acquire().await?;
 
         tokio::spawn(async move {
