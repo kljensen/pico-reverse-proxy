@@ -1,67 +1,87 @@
 use tokio::{net::TcpListener, io::{AsyncReadExt, AsyncWriteExt}};
+use tokio::sync::Semaphore;
 use std::error::Error;
 use tokio::io::copy_bidirectional;
 use clap::Parser;
 
-/// Simple HTTP proxy that forwards traffic between source and destination
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Source address to listen on (e.g., "localhost:8080")
     #[arg(short, long)]
     source: String,
 
-    /// Destination address to forward to (e.g., "example.com:80")
     #[arg(short, long)]
     destination: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    // Parse command line arguments
-    let args = Args::parse();
+// Use smaller buffer size - 4KB is often sufficient for HTTP
+const BUFFER_SIZE: usize = 4096;
+
+async fn handle_connection(
+    mut client_conn: tokio::net::TcpStream,
+    destination: &str,
+) {
+    // Stack-allocated buffer instead of heap
+    let mut buffer = [0u8; BUFFER_SIZE];
     
-    // Listen on the specified source address
+    // Set socket options to minimize memory
+    if let Err(e) = client_conn.set_nodelay(true) {
+        eprintln!("Failed to set nodelay: {}", e);
+    }
+
+    let n = match client_conn.read(&mut buffer).await {
+        Ok(0) => return,
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Failed to read from client: {}", e);
+            return;
+        }
+    };
+
+    let mut server_conn = match tokio::net::TcpStream::connect(destination).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("Failed to connect to target server: {}", e);
+            return;
+        }
+    };
+
+    // Set socket options for server connection too
+    if let Err(e) = server_conn.set_nodelay(true) {
+        eprintln!("Failed to set nodelay: {}", e);
+    }
+
+    if let Err(e) = server_conn.write_all(&buffer[..n]).await {
+        eprintln!("Failed to write to server: {}", e);
+        return;
+    }
+
+    match copy_bidirectional(&mut client_conn, &mut server_conn).await {
+        Ok(_) => (),  // Don't allocate strings for logging
+        Err(e) => eprintln!("Error in copy: {}", e),
+    }
+}
+
+static MAX_CONNECTIONS: usize = 100;
+static CONNECTION_SEMAPHORE: Semaphore = Semaphore::const_new(MAX_CONNECTIONS);
+
+
+#[tokio::main(flavor = "current_thread")]  // Single-threaded runtime
+async fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
     let listener = TcpListener::bind(&args.source).await?;
-    println!("Listening on {}", args.source);
 
-    loop {
-        let (mut client_conn, _) = listener.accept().await?;
+    while let Ok((client_conn, _)) = listener.accept().await {
+        // Pass destination as reference to avoid cloning
+        let dest_clone = args.destination.clone();
         
-        // Clone destination for the async task
-        let destination = args.destination.clone();
-        
-        // Spawn a new task for each connection
+        let permit = CONNECTION_SEMAPHORE.acquire().await?;
+
         tokio::spawn(async move {
-            let mut buffer = [0; 8192];
-            
-            // Read the client request
-            match client_conn.read(&mut buffer).await {
-                Ok(0) => (),
-                Ok(n) => {
-                    // Connect to the target server
-                    match tokio::net::TcpStream::connect(&destination).await {
-                        Ok(mut server_conn) => {
-                            // Forward the client request to the server
-                            if let Err(e) = server_conn.write_all(&buffer[..n]).await {
-                                eprintln!("Failed to write to server: {}", e);
-                                return;
-                            }
-
-                            // Use copy_bidirectional to handle the duplex connection
-                            match copy_bidirectional(&mut client_conn, &mut server_conn).await {
-                                Ok((from_client, from_server)) => {
-                                    println!("Connection closed. Bytes from client: {}, from server: {}", 
-                                        from_client, from_server);
-                                }
-                                Err(e) => eprintln!("Error in bidirectional copy: {}", e),
-                            }
-                        }
-                        Err(e) => eprintln!("Failed to connect to target server: {}", e),
-                    }
-                }
-                Err(e) => eprintln!("Failed to read from client: {}", e),
-            }
+            handle_connection(client_conn, &dest_clone).await;
+            drop(permit);
         });
     }
+
+    Ok(())
 }
