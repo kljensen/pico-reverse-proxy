@@ -52,21 +52,8 @@ async fn handle_connection(mut client_conn: tokio::net::TcpStream, destination: 
         eprintln!("Failed to set nodelay: {}", e);
     }
 
-    // Use splice if available on Linux systems
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::AsRawFd;
-        if let Err(e) =
-            tokio::io::copy_bidirectional_zero_copy(&mut client_conn, &mut server_conn).await
-        {
-            eprintln!("Error in zero-copy: {}", e);
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        if let Err(e) = copy_bidirectional(&mut client_conn, &mut server_conn).await {
-            eprintln!("Error in copy: {}", e);
-        }
+    if let Err(e) = copy_bidirectional(&mut client_conn, &mut server_conn).await {
+        eprintln!("Error in copy: {}", e);
     }
 }
 
